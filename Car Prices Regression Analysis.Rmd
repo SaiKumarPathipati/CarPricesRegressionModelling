@@ -1,0 +1,311 @@
+---
+title: "Car Prices Regression Analysis"
+output: html_document
+date: "2023-12-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading Required Libraries:
+
+
+```{r, warning=FALSE, message=FALSE}
+library(dplyr)
+library(Metrics)
+library(tidyr)
+library(caret)
+library(e1071)
+library(rpart)
+library(glmnet)
+```
+
+## Data Preparation:
+
+```{r, warning=FALSE, message=FALSE}
+# Reading the dataset
+data <- read.csv("oman_car_prices_2023.csv")
+
+# Function to print unique values in categorical columns
+print_unique_values <- function(data) {
+  # Identify categorical columns
+  categorical_columns <- sapply(data, is.character)
+  
+  # Print unique values in each categorical column
+  for (col in names(data)[categorical_columns]) {
+    unique_values <- length(unique(data[[col]]))
+    cat(paste("Unique values in", col, ":", (unique_values), "\n"))
+  }
+}
+
+# Call the function with your data frame
+print_unique_values(data)
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+# Split the Values column into multiple columns
+data_sub <- data %>%
+  separate(Exterior.Options, into = paste0("Exterior_Option_", 1:20), sep = "\\|", extra = "merge")
+
+data_sub <- data_sub %>%
+  separate(Interior.Options, into = paste0("Interior_Option_", 1:30), sep = ",", extra = "merge")
+str(data_sub)
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+# Function to remove columns with more than 30% missing values
+remove_columns_with_missing <- function(data, threshold = 0.3) {
+  # Calculate the percentage of missing values in each column
+  missing_percentages <- colMeans(is.na(data))
+  
+  # Identify columns with missing values exceeding the threshold
+  columns_to_remove <- names(missing_percentages[missing_percentages > threshold])
+  
+  # Remove identified columns
+  data <- data[, !(names(data) %in% columns_to_remove)]
+  
+  return(data)
+}
+
+# Call the function with your data frame
+df_filtered <- remove_columns_with_missing(data_sub, threshold = 0.3)
+
+# Remove model column
+df_filtered <- df_filtered %>%
+  select(-Model)
+
+# Remove missing values
+df_filtered <- (na.omit(df_filtered))
+
+# Identify character columns
+char_columns <- sapply(df_filtered, is.character)
+
+# Perform one-hot encoding on character columns
+df_encoded <- as.data.frame(cbind(df_filtered[, !char_columns], 
+                    model.matrix(~ . - 1, 
+                                 df_filtered[char_columns])))
+
+# Rename price column
+names(df_encoded)[1] <- "Price"
+```
+
+
+## Data Modelling:
+
+```{r}
+set.seed(5555)
+# Create an index for splitting the data
+index <- createDataPartition(df_encoded$Price, p = 0.8, list = FALSE)
+train_data <- df_encoded[index, ]
+test_data <- df_encoded[-index, ]
+```
+
+### Base SVM Model:
+
+```{r, warning=FALSE, message=FALSE}
+set.seed(5555)
+svm_model <- svm(Price ~ ., 
+                 data = train_data)
+
+svm_model
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+# Make predictions on the test set
+svm_predictions <- predict(svm_model, newdata = test_data)
+
+cat("RMSE is : ", rmse(svm_predictions, test_data$Price))
+cat("MAE is : ", mae(svm_predictions, test_data$Price))
+cat("MAPE is : ", mape(svm_predictions, test_data$Price))
+```
+
+
+### Fine-Tuned SVM Model:
+
+```{r, warning=FALSE, message=FALSE}
+set.seed(5555)
+tuned_svm_model <- tune(svm, 
+                        Price ~ ., 
+                        data = train_data, 
+                        kernel = "radial", 
+                        ranges = list(cost = c(0.1, 1, 10)))
+
+# Select the optimal tuning parameter
+best_svm_model <- tuned_svm_model$best.model
+
+best_svm_model
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+# Make predictions on the test set
+svm_predictions <- predict(best_svm_model, newdata = test_data)
+
+cat("RMSE is : ", rmse(svm_predictions, test_data$Price))
+cat("MAE is : ", mae(svm_predictions, test_data$Price))
+cat("MAPE is : ", mape(svm_predictions, test_data$Price))
+```
+
+## Decision Tree Model:
+
+### Base Decision Tree Model:
+
+```{r, warning=FALSE, message=FALSE}
+set.seed(5555)
+model_dt_b <- rpart(Price ~.,
+                    data = train_data,
+                    method = "anova")
+model_dt_b
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+dt_predictions <- predict(model_dt_b, test_data)
+
+cat("RMSE is : ", rmse(dt_predictions, test_data$Price))
+cat("MAE is : ", mae(dt_predictions, test_data$Price))
+cat("MAPE is : ", mape(dt_predictions, test_data$Price))
+```
+
+
+### Fine-Tuned Decision Tree Model:
+
+```{r, warning=FALSE, message=FALSE}
+set.seed(5555)
+# Define the parameter grid for tuning
+param_grid <- expand.grid(maxdepth = c(5, 10, 15),
+                          minsplit = c(2, 5, 10),
+                          cp = seq(0.01, 0.1, by = 0.01))
+
+# Create an empty list to store models
+models <- list()
+
+# Loop through the parameter values
+for (i in seq_along(1:nrow(param_grid))) {
+  maxdepth_value <- param_grid$maxdepth[i]
+  minsplit_value <- param_grid$minsplit[i]
+  cp_value <- param_grid$cp[i]
+  
+  # Build the decision tree model
+  dt_model <- rpart(Price ~ ., data = train_data, method = "anova", 
+                    control = rpart.control(maxdepth = maxdepth_value, 
+                                            minsplit = minsplit_value, 
+                                            cp = cp_value))
+  
+  # Store the model in the list
+  models[[i]] <- dt_model
+}
+
+# Assess model performance using cross-validation
+cv_results <- lapply(models, function(model) {
+  predictions <- predict(model, newdata = train_data)
+  rmse_value <- sqrt(mean((predictions - train_data$Price)^2))
+  return(rmse_value)
+})
+
+# Find the index of the best performing model
+best_model_index <- which.min(cv_results)
+
+# Retrieve the best model
+best_dt_model <- models[[best_model_index]]
+
+# Display the best tuning parameters
+print(paste("Best Max Depth:", param_grid$maxdepth[best_model_index]))
+print(paste("Best Min Samples Split:", param_grid$minsplit[best_model_index]))
+print(paste("Best CP value:", param_grid$cp[best_model_index]))
+```
+
+```{r, warning=FALSE, message=FALSE}
+set.seed(5555)
+model_dt_tuned <- rpart(Price ~.,
+                    data = train_data,
+                    method = "anova",
+                    maxdepth = 10,
+                    minsplit = 2,
+                    cp = 0.01)
+
+dt_predictions <- predict(model_dt_tuned, test_data)
+
+cat("RMSE is : ", rmse(dt_predictions, test_data$Price))
+cat("MAE is : ", mae(dt_predictions, test_data$Price))
+cat("MAPE is : ", mape(dt_predictions, test_data$Price))
+```
+
+
+## Lasso Regression Model:
+
+### Base Lasso Regression Model:
+
+```{r, warning=FALSE, message=FALSE}
+set.seed(5555)
+# Train a base Lasso model
+base_lasso_model <- glmnet(x = as.matrix(train_data[, -1]), # Assuming the first column is the response variable
+                           y = train_data$Price,
+                           alpha = 1, # 1 for Lasso, 0 for Ridge, values in between for elastic net
+                           family = "gaussian")
+
+# Display summary of the base Lasso model
+print(base_lasso_model)
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+# Make predictions on the training set (just an example, you would typically use a test set)
+lasso_predictions <- predict(base_lasso_model, newx = as.matrix(train_data[, -1]))
+
+# Display evaluation metrics
+cat("RMSE is : ", rmse(lasso_predictions, test_data$Price))
+cat("MAE is : ", mae(lasso_predictions, test_data$Price))
+cat("MAPE is : ", mape(lasso_predictions, test_data$Price))
+```
+
+### Fine-Tuned Lasso Regression Model:
+
+```{r, warning=FALSE, message=FALSE}
+set.seed(5555)
+# Set up a grid of hyperparameters for tuning
+lasso_grid <- expand.grid(alpha = 1,        # 1 for Lasso
+                          lambda = seq(0.001, 1, length = 20)) # Vary lambda values
+
+# Use cross-validation to tune the Lasso model
+lasso_tune <- train(x = as.matrix(train_data[, -1]),
+                    y = train_data$Price,
+                    method = "glmnet",
+                    trControl = trainControl(method = "cv", number = 5),
+                    tuneGrid = lasso_grid)
+
+# Display the tuning results
+print(lasso_tune)
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+# Access the best tuned Lasso model
+best_lasso_model <- lasso_tune$finalModel
+
+# Make predictions on the training set (just an example, you would typically use a test set)
+lasso_predictions <- predict(best_lasso_model, newx = as.matrix(train_data[, -1]))
+
+# Display evaluation metrics
+cat("RMSE is : ", rmse(lasso_predictions, test_data$Price))
+cat("MAE is : ", mae(lasso_predictions, test_data$Price))
+cat("MAPE is : ", mape(lasso_predictions, test_data$Price))
+```
+
+
+## Saving Best Model:
+
+```{r}
+saveRDS(model_dt_tuned, "Decision_Tree_Best_Model.rds")
+saveRDS(best_lasso_model, "Lasso_Tuned.rds")
+saveRDS(best_svm_model, "SVM_Model.rds")
+```
+
+
+
+
+
